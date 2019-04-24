@@ -10,12 +10,17 @@ import (
 	"sync"
 )
 
+const (
+	NVIDIA_GPU = "nvidia.com/gpu"
+)
+
 type nodeResourcesCollector struct {
 	kubernetesClient *kubernetes.Client
 
 	// Allocatable
 	allocatableCPUCoresDesc    *prometheus.Desc
 	allocatableMemoryBytesDesc *prometheus.Desc
+	allocatableGPUDesc         *prometheus.Desc
 
 	// Resource limits
 	limitCPUCoresDesc    *prometheus.Desc
@@ -28,6 +33,7 @@ type nodeResourcesCollector struct {
 	// Resource usage
 	usageCPUCoresDesc    *prometheus.Desc
 	usageMemoryBytesDesc *prometheus.Desc
+	usageGPUDesc         *prometheus.Desc
 }
 
 func init() {
@@ -50,6 +56,12 @@ func newNodeResourcesCollector(opts *options.Options) (Collector, error) {
 		allocatableMemoryBytesDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(opts.Namespace, subsystem, "allocatable_memory_bytes"),
 			"Allocatable memory bytes on a specific node in Kubernetes",
+			labels,
+			prometheus.Labels{},
+		),
+		allocatableGPUDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(opts.Namespace, subsystem, "allocatable_gpu"),
+			"Allocatable GPU on a specific node in Kubernetes",
 			labels,
 			prometheus.Labels{},
 		),
@@ -89,6 +101,12 @@ func newNodeResourcesCollector(opts *options.Options) (Collector, error) {
 		usageMemoryBytesDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(opts.Namespace, subsystem, "usage_memory_bytes"),
 			"Total number of RAM bytes used on a node",
+			labels,
+			prometheus.Labels{},
+		),
+		usageGPUDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(opts.Namespace, subsystem, "usage_gpu"),
+			"Total number of GPU used on a node",
 			labels,
 			prometheus.Labels{},
 		),
@@ -147,15 +165,11 @@ func (c *nodeResourcesCollector) updateMetrics(ch chan<- prometheus.Metric) erro
 		// allocatable
 		allocatableCPU := n.Status.Allocatable.Cpu().Value()
 		allocatableMemoryBytes := float64(n.Status.Allocatable.Memory().MilliValue()) / 1000
+		allocatableG := n.Status.Allocatable[NVIDIA_GPU]
+		allocatableGPU := allocatableG.Value()
 		ch <- prometheus.MustNewConstMetric(c.allocatableCPUCoresDesc, prometheus.GaugeValue, float64(allocatableCPU), n.Name)
 		ch <- prometheus.MustNewConstMetric(c.allocatableMemoryBytesDesc, prometheus.GaugeValue, float64(allocatableMemoryBytes), n.Name)
-
-		// resource usage
-		usageMetrics := nodeMetricsByNodeName[n.Name]
-		usageCPU := float64(usageMetrics.Usage.Cpu().MilliValue()) / 1000
-		usageMemoryBytes := float64(usageMetrics.Usage.Memory().MilliValue()) / 1000
-		ch <- prometheus.MustNewConstMetric(c.usageCPUCoresDesc, prometheus.GaugeValue, float64(usageCPU), n.Name)
-		ch <- prometheus.MustNewConstMetric(c.usageMemoryBytesDesc, prometheus.GaugeValue, float64(usageMemoryBytes), n.Name)
+		ch <- prometheus.MustNewConstMetric(c.allocatableGPUDesc, prometheus.GaugeValue, float64(allocatableGPU), n.Name)
 
 		// aggregated pod metrics (e. g. resource requests by node)
 		podMetrics := podMetricsByNodeName[n.Name]
@@ -163,6 +177,14 @@ func (c *nodeResourcesCollector) updateMetrics(ch chan<- prometheus.Metric) erro
 		ch <- prometheus.MustNewConstMetric(c.requestMemoryBytesDesc, prometheus.GaugeValue, float64(podMetrics.requestedMemoryBytes), n.Name)
 		ch <- prometheus.MustNewConstMetric(c.limitCPUCoresDesc, prometheus.GaugeValue, podMetrics.limitCPUCores, n.Name)
 		ch <- prometheus.MustNewConstMetric(c.limitMemoryBytesDesc, prometheus.GaugeValue, float64(podMetrics.limitMemoryBytes), n.Name)
+
+		// resource usage
+		usageMetrics := nodeMetricsByNodeName[n.Name]
+		usageCPU := float64(usageMetrics.Usage.Cpu().MilliValue()) / 1000
+		usageMemoryBytes := float64(usageMetrics.Usage.Memory().MilliValue()) / 1000
+		ch <- prometheus.MustNewConstMetric(c.usageCPUCoresDesc, prometheus.GaugeValue, float64(usageCPU), n.Name)
+		ch <- prometheus.MustNewConstMetric(c.usageMemoryBytesDesc, prometheus.GaugeValue, float64(usageMemoryBytes), n.Name)
+		ch <- prometheus.MustNewConstMetric(c.usageGPUDesc, prometheus.GaugeValue, float64(podMetrics.gpu), n.Name)
 	}
 
 	return nil
@@ -185,6 +207,7 @@ type aggregatedPodMetrics struct {
 	requestedCPUCores    float64
 	limitMemoryBytes     int64
 	limitCPUCores        float64
+	gpu                  float64
 }
 
 // getAggregatedPodMetricsByNodeName returns a map of aggregated pod metrics grouped by node name.
@@ -207,6 +230,8 @@ func getAggregatedPodMetricsByNodeName(pods *corev1.PodList) map[string]aggregat
 			requestedMemoryBytes := c.Resources.Requests.Memory().MilliValue() / 1000
 			limitCPUCores := float64(c.Resources.Limits.Cpu().MilliValue()) / 1000
 			limitMemoryBytes := c.Resources.Limits.Memory().MilliValue() / 1000
+			gpu := c.Resources.Limits[NVIDIA_GPU]
+			usedGpu := float64(gpu.Value())
 
 			podMetrics[nodeName] = aggregatedPodMetrics{
 				podCount:             podCount,
@@ -215,6 +240,7 @@ func getAggregatedPodMetricsByNodeName(pods *corev1.PodList) map[string]aggregat
 				requestedMemoryBytes: podMetrics[nodeName].requestedMemoryBytes + requestedMemoryBytes,
 				limitCPUCores:        podMetrics[nodeName].limitCPUCores + limitCPUCores,
 				limitMemoryBytes:     podMetrics[nodeName].limitMemoryBytes + limitMemoryBytes,
+				gpu:                  podMetrics[nodeName].gpu + usedGpu,
 			}
 		}
 	}
